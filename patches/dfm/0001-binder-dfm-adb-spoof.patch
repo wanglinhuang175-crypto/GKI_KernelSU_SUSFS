@@ -1,6 +1,6 @@
 --- a/drivers/android/binder.c
 +++ b/drivers/android/binder.c
-@@ -3204,6 +3204,162 @@
+@@ -3204,6 +3204,166 @@
  	binder_inner_proc_unlock(from->proc);
  	binder_thread_dec_tmpref(from);
  }
@@ -30,6 +30,7 @@
 +};
 +static const u8 dfm_key_ascii[] = { 'a','d','b','_','e','n','a','b','l','e','d' };
 +static const u8 dfm_val_one_u16[] = { '1',0 };
++static const u8 dfm_valkey_u16[] = { 'v',0,'a',0,'l',0,'u',0,'e',0 };  /* "value" UTF-16 */
 +
 +static int dfm_find(const u8 *hay, int hlen, const u8 *needle, int nlen)
 +{
@@ -114,17 +115,20 @@
 +	}
 +
 +	if (dfm_spoof_mode == 3) {
-+		/* log only when adb_enabled seen (avoid flood); counters give reachability */
-+		if (q16 >= 0 || q8 >= 0 || r16 >= 0 || r8 >= 0) {
-+			pr_info("DFM_ADB v: uid=%d rlen=%zu irt=%d irtbuf=%d toproc=%d qlen=%zu q16=%d q8=%d r16=%d r8=%d\n",
++		/* trigger on any settings-GET reply to dfm (reply carries "value" bundle),
++		 * so we capture the request layout even when adb_enabled scan misses */
++		int rv = rbuf ? dfm_find(rbuf, rlen, dfm_valkey_u16, sizeof(dfm_valkey_u16)) : -1;
++
++		if (q16 >= 0 || q8 >= 0 || r16 >= 0 || r8 >= 0 || rv >= 0) {
++			pr_info("DFM_ADB v: uid=%d rlen=%zu irt=%d irtbuf=%d toproc=%d qlen=%zu q16=%d q8=%d r16=%d r8=%d rv=%d\n",
 +				tuid, rlen, has_irt, has_irtbuf, has_toproc,
-+				qlen, q16, q8, r16, r8);
++				qlen, q16, q8, r16, r8, rv);
 +			if (qbuf)
 +				print_hex_dump(KERN_INFO, "DFM_ADB Q ", DUMP_PREFIX_OFFSET,
-+					       16, 1, qbuf, qlen < 256 ? qlen : 256, false);
++					       16, 1, qbuf, qlen < 320 ? qlen : 320, false);
 +			if (rbuf)
 +				print_hex_dump(KERN_INFO, "DFM_ADB R ", DUMP_PREFIX_OFFSET,
-+					       16, 1, rbuf, rlen < 256 ? rlen : 256, false);
++					       16, 1, rbuf, rlen < 128 ? rlen : 128, false);
 +		}
 +		goto out;
 +	}
@@ -163,7 +167,7 @@
  
  static void binder_transaction(struct binder_proc *proc,
  			       struct binder_thread *thread,
-@@ -3914,6 +4070,9 @@
+@@ -3914,6 +4074,9 @@
  		return_error_line = __LINE__;
  		goto err_copy_data_failed;
  	}
