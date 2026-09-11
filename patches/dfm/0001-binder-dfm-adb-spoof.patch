@@ -1,6 +1,6 @@
 --- a/drivers/android/binder.c
 +++ b/drivers/android/binder.c
-@@ -3204,6 +3204,166 @@
+@@ -3204,6 +3204,148 @@
  	binder_inner_proc_unlock(from->proc);
  	binder_thread_dec_tmpref(from);
  }
@@ -12,167 +12,149 @@
 +#include <linux/cred.h>
 +#include <linux/uidgid.h>
 +#include <linux/printk.h>
++#include <linux/spinlock.h>
 +
-+/* 0=off 1=observe(log on match) 2=patch 3=verbose-diagnostic */
-+static int dfm_spoof_mode = 3;
++/* 0=off 1=log-match 2=patch 3=verbose */
++static int dfm_spoof_mode = 2;
 +module_param(dfm_spoof_mode, int, 0644);
 +static int dfm_uid = 10297;
 +module_param(dfm_uid, int, 0644);
-+static int dfm_hits;
-+module_param(dfm_hits, int, 0444);
-+static int dfm_total_replies;
-+module_param(dfm_total_replies, int, 0444);
-+static int dfm_uid_replies;
-+module_param(dfm_uid_replies, int, 0444);
++static int dfm_reqs;
++module_param(dfm_reqs, int, 0444);
++static int dfm_matched;
++module_param(dfm_matched, int, 0444);
++static int dfm_patched;
++module_param(dfm_patched, int, 0444);
 +
-+static const u8 dfm_key_u16[] = {
-+	'a',0,'d',0,'b',0,'_',0,'e',0,'n',0,'a',0,'b',0,'l',0,'e',0,'d',0
-+};
-+static const u8 dfm_key_ascii[] = { 'a','d','b','_','e','n','a','b','l','e','d' };
-+static const u8 dfm_val_one_u16[] = { '1',0 };
-+static const u8 dfm_valkey_u16[] = { 'v',0,'a',0,'l',0,'u',0,'e',0 };  /* "value" UTF-16 */
++static const u8 dfm_key_u16[] = {'a',0,'d',0,'b',0,'_',0,'e',0,'n',0,'a',0,'b',0,'l',0,'e',0,'d',0};
++static const u8 dfm_key_ascii[] = {'a','d','b','_','e','n','a','b','l','e','d'};
++static const u8 dfm_str_one[] = {0x01,0,0,0,'1',0};   /* UTF-16 string "1" */
 +
-+static int dfm_find(const u8 *hay, int hlen, const u8 *needle, int nlen)
++static int dfm_find(const u8 *h, int hl, const u8 *n, int nl)
 +{
 +	int i;
-+	if (nlen <= 0 || hlen < nlen)
-+		return -1;
-+	for (i = 0; i <= hlen - nlen; i++)
-+		if (!memcmp(hay + i, needle, nlen))
-+			return i;
++	if (nl <= 0 || hl < nl) return -1;
++	for (i = 0; i <= hl - nl; i++)
++		if (!memcmp(h + i, n, nl)) return i;
 +	return -1;
 +}
 +
-+static int dfm_find_last(const u8 *hay, int hlen, const u8 *needle, int nlen)
++#define DFM_RING 256
++static int dfm_ring[DFM_RING];
++static int dfm_ring_head;
++static DEFINE_SPINLOCK(dfm_ring_lock);
++static void dfm_ring_add(int id)
 +{
-+	int last = -1, from = 0, f;
-+	while (from < hlen &&
-+	       (f = dfm_find(hay + from, hlen - from, needle, nlen)) >= 0) {
-+		last = from + f;
-+		from = last + nlen;
-+	}
-+	return last;
++	unsigned long f;
++	spin_lock_irqsave(&dfm_ring_lock, f);
++	dfm_ring[dfm_ring_head & (DFM_RING - 1)] = id;
++	dfm_ring_head++;
++	spin_unlock_irqrestore(&dfm_ring_lock, f);
++}
++static int dfm_ring_take(int id)
++{
++	int i, hit = 0;
++	unsigned long f;
++	if (!id) return 0;
++	spin_lock_irqsave(&dfm_ring_lock, f);
++	for (i = 0; i < DFM_RING; i++)
++		if (dfm_ring[i] == id) { dfm_ring[i] = 0; hit = 1; break; }
++	spin_unlock_irqrestore(&dfm_ring_lock, f);
++	return hit;
 +}
 +
-+static void dfm_adb_hook(int reply, struct binder_proc *target_proc,
++static int dfm_uid_of(struct binder_proc *p)
++{
++	kuid_t euid;
++	if (!p || !p->tsk) return -1;
++	rcu_read_lock();
++	euid = __task_cred(p->tsk)->euid;
++	rcu_read_unlock();
++	return from_kuid(&init_user_ns, euid);
++}
++
++static void dfm_adb_hook(int reply, struct binder_proc *proc,
++			 struct binder_proc *target_proc,
 +			 struct binder_transaction *in_reply_to,
 +			 struct binder_transaction *t)
 +{
-+	kuid_t euid;
-+	int tuid;
-+	size_t rlen = 0, qlen = 0;
-+	u8 *rbuf = NULL, *qbuf = NULL;
-+	int q16 = -1, q8 = -1, r16 = -1, r8 = -1;
-+	int has_irt, has_irtbuf, has_toproc;
++	u8 *buf = NULL;
++	size_t len;
 +
-+	if (!reply || dfm_spoof_mode == 0)
-+		return;
-+	if (!target_proc || !target_proc->tsk || !t || !t->buffer)
++	if (dfm_spoof_mode == 0 || !t || !t->buffer)
 +		return;
 +
-+	dfm_total_replies++;
-+
-+	rcu_read_lock();
-+	euid = __task_cred(target_proc->tsk)->euid;
-+	rcu_read_unlock();
-+	tuid = from_kuid(&init_user_ns, euid);
-+	if (tuid != dfm_uid)
-+		return;
-+
-+	dfm_uid_replies++;
-+
-+	has_irt = !!in_reply_to;
-+	has_irtbuf = in_reply_to ? !!in_reply_to->buffer : 0;
-+	has_toproc = in_reply_to ? !!in_reply_to->to_proc : 0;
-+
-+	rlen = t->buffer->data_size;
-+	if (rlen > 0 && rlen <= 4096) {
-+		rbuf = kmalloc(rlen, GFP_KERNEL);
-+		if (rbuf && binder_alloc_copy_from_buffer(&target_proc->alloc,
-+							  rbuf, t->buffer, 0, rlen)) {
-+			kfree(rbuf);
-+			rbuf = NULL;
++	if (!reply) {
++		/* request: sender=proc(dfm?), data in target_proc(SettingsProvider) alloc */
++		if (dfm_uid_of(proc) != dfm_uid || !target_proc)
++			return;
++		len = t->buffer->data_size;
++		if (len == 0 || len > 8192)
++			return;
++		buf = kmalloc(len, GFP_KERNEL);
++		if (!buf)
++			return;
++		if (binder_alloc_copy_from_buffer(&target_proc->alloc, buf, t->buffer, 0, len))
++			goto out;
++		if (dfm_find(buf, len, dfm_key_u16, sizeof(dfm_key_u16)) >= 0 ||
++		    dfm_find(buf, len, dfm_key_ascii, sizeof(dfm_key_ascii)) >= 0) {
++			dfm_ring_add(t->debug_id);
++			dfm_reqs++;
++			if (dfm_spoof_mode == 3)
++				pr_info("DFM_ADB req id=%d len=%zu\n", t->debug_id, len);
 +		}
++		goto out;
 +	}
-+	if (has_irtbuf && has_toproc) {
-+		qlen = in_reply_to->buffer->data_size;
-+		if (qlen > 0 && qlen <= 8192) {
-+			qbuf = kmalloc(qlen, GFP_KERNEL);
-+			if (qbuf && binder_alloc_copy_from_buffer(&in_reply_to->to_proc->alloc,
-+								  qbuf, in_reply_to->buffer, 0, qlen)) {
-+				kfree(qbuf);
-+				qbuf = NULL;
++
++	/* reply: target=target_proc(dfm?), data in target_proc alloc */
++	if (dfm_uid_of(target_proc) != dfm_uid || !in_reply_to)
++		return;
++	if (!dfm_ring_take(in_reply_to->debug_id))
++		return;
++	dfm_matched++;
++
++	len = t->buffer->data_size;
++	if (len == 0 || len > 8192)
++		return;
++	buf = kmalloc(len, GFP_KERNEL);
++	if (!buf)
++		return;
++	if (binder_alloc_copy_from_buffer(&target_proc->alloc, buf, t->buffer, 0, len))
++		goto out;
++
++	if (dfm_spoof_mode == 1 || dfm_spoof_mode == 3) {
++		pr_info("DFM_ADB match id=%d rlen=%zu\n", in_reply_to->debug_id, len);
++		print_hex_dump(KERN_INFO, "DFM_ADB M ", DUMP_PREFIX_OFFSET, 16, 1,
++			       buf, len < 256 ? len : 256, false);
++		if (dfm_spoof_mode == 1)
++			goto out;
++	}
++
++	{
++		int p = dfm_find(buf, len, dfm_str_one, sizeof(dfm_str_one));
++		if (p >= 0) {
++			u8 zero = '0';
++			if (!binder_alloc_copy_to_buffer(&target_proc->alloc, t->buffer,
++							 p + 4, &zero, 1)) {
++				dfm_patched++;
++				pr_info("DFM_ADB patched id=%d off=%d\n",
++					in_reply_to->debug_id, p + 4);
 +			}
 +		}
 +	}
-+	if (qbuf) {
-+		q16 = dfm_find(qbuf, qlen, dfm_key_u16, sizeof(dfm_key_u16));
-+		q8 = dfm_find(qbuf, qlen, dfm_key_ascii, sizeof(dfm_key_ascii));
-+	}
-+	if (rbuf) {
-+		r16 = dfm_find(rbuf, rlen, dfm_key_u16, sizeof(dfm_key_u16));
-+		r8 = dfm_find(rbuf, rlen, dfm_key_ascii, sizeof(dfm_key_ascii));
-+	}
-+
-+	if (dfm_spoof_mode == 3) {
-+		/* trigger on any settings-GET reply to dfm (reply carries "value" bundle),
-+		 * so we capture the request layout even when adb_enabled scan misses */
-+		int rv = rbuf ? dfm_find(rbuf, rlen, dfm_valkey_u16, sizeof(dfm_valkey_u16)) : -1;
-+
-+		if (q16 >= 0 || q8 >= 0 || r16 >= 0 || r8 >= 0 || rv >= 0) {
-+			pr_info("DFM_ADB v: uid=%d rlen=%zu irt=%d irtbuf=%d toproc=%d qlen=%zu q16=%d q8=%d r16=%d r8=%d rv=%d\n",
-+				tuid, rlen, has_irt, has_irtbuf, has_toproc,
-+				qlen, q16, q8, r16, r8, rv);
-+			if (qbuf)
-+				print_hex_dump(KERN_INFO, "DFM_ADB Q ", DUMP_PREFIX_OFFSET,
-+					       16, 1, qbuf, qlen < 320 ? qlen : 320, false);
-+			if (rbuf)
-+				print_hex_dump(KERN_INFO, "DFM_ADB R ", DUMP_PREFIX_OFFSET,
-+					       16, 1, rbuf, rlen < 128 ? rlen : 128, false);
-+		}
-+		goto out;
-+	}
-+
-+	if (q16 < 0 && q8 < 0)
-+		goto out;   /* request 不含 adb_enabled */
-+	dfm_hits++;
-+
-+	if (dfm_spoof_mode == 1) {
-+		pr_info("DFM_ADB: hit#%d uid=%d rlen=%zu q16=%d q8=%d r16=%d r8=%d\n",
-+			dfm_hits, tuid, rlen, q16, q8, r16, r8);
-+		if (rbuf)
-+			print_hex_dump(KERN_INFO, "DFM_ADB RPL ", DUMP_PREFIX_OFFSET,
-+				       16, 1, rbuf, rlen < 256 ? rlen : 256, false);
-+		goto out;
-+	}
-+
-+	/* mode 2: value = 末尾 UTF-16 '1' (31 00) -> '0' (30 00) */
-+	if (rbuf) {
-+		int p = dfm_find_last(rbuf, rlen, dfm_val_one_u16, sizeof(dfm_val_one_u16));
-+
-+		if (p >= 0) {
-+			u8 zero[2] = { '0', 0 };
-+
-+			if (!binder_alloc_copy_to_buffer(&target_proc->alloc,
-+							 t->buffer, p, zero, 2))
-+				pr_info("DFM_ADB: patched '1'->'0' at off=%d uid=%d\n",
-+					p, tuid);
-+		}
-+	}
 +out:
-+	kfree(rbuf);
-+	kfree(qbuf);
++	kfree(buf);
 +}
 +/* ===== end DFM hook ===== */
  
  static void binder_transaction(struct binder_proc *proc,
  			       struct binder_thread *thread,
-@@ -3914,6 +4074,9 @@
+@@ -3914,6 +4056,9 @@
  		return_error_line = __LINE__;
  		goto err_copy_data_failed;
  	}
 +	/* DFM adb_enabled spoof hook */
-+	dfm_adb_hook(reply, target_proc, in_reply_to, t);
++	dfm_adb_hook(reply, proc, target_proc, in_reply_to, t);
 +
  	if (t->buffer->oneway_spam_suspect)
  		tcomplete->type = BINDER_WORK_TRANSACTION_ONEWAY_SPAM_SUSPECT;
