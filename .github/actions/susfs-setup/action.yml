@@ -46,5 +46,13 @@ runs:
         echo "SUSFS_COMMIT=$SUSFS_COMMIT" >> "$GITHUB_ENV"
         echo "Using SUSFS commit: $SUSFS_COMMIT"
 
-        patch -p1 < "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0001-pershoot-Allow-core-to-be-built-with-no-features.patch"
-        patch -p1 < "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"
+        # [DFM-fix] upstream removed pershoot susfs4ksu pins (kernel_patches
+        # 4285cd1 "GKI fetches top-2 live now"); apply only if still present.
+        for _p in           "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0001-pershoot-Allow-core-to-be-built-with-no-features.patch"           "${{ github.workspace }}/kernel_patches/pershoot/susfs4ksu/0002-pershoot-Implement-SuSFS-and-Toolkit-coexistence.patch"; do
+          if [ -f "$_p" ]; then
+            echo "Applying pershoot patch: $_p"
+            patch -p1 < "$_p"
+          else
+            echo "[DFM-fix] pershoot patch absent, skipping: $_p"
+          fi
+        done
