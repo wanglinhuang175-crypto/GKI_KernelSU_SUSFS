@@ -351,6 +351,22 @@ jobs:
           perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
         fi
 
+    - name: Apply DFM adb_enabled spoof patch
+      shell: bash
+      run: |
+        set -ex
+        PATCH="$GITHUB_WORKSPACE/patches/dfm/0001-binder-dfm-adb-spoof.patch"
+        # 自动定位 common 内核树里的 binder.c, 不写死路径
+        BINDER=$(find "$GITHUB_WORKSPACE" -path '*/common/drivers/android/binder.c' 2>/dev/null | head -n1)
+        [ -n "$BINDER" ] || BINDER=$(find "$GITHUB_WORKSPACE" -path '*/drivers/android/binder.c' 2>/dev/null | head -n1)
+        test -n "$BINDER"
+        ROOT="${BINDER%/drivers/android/binder.c}"
+        echo "[DFM] kernel root: $ROOT"
+        cd "$ROOT"
+        patch -p1 --forward < "$PATCH"
+        grep -q "dfm_adb_hook(reply" drivers/android/binder.c
+        echo "[DFM] binder patch applied OK"
+
     - name: Apply Kernel Branding
       uses: ./.github/actions/apply-kernel-branding
       with:
