@@ -1,6 +1,6 @@
 --- a/drivers/android/binder.c
 +++ b/drivers/android/binder.c
-@@ -3204,6 +3204,128 @@
+@@ -3204,6 +3204,162 @@
  	binder_inner_proc_unlock(from->proc);
  	binder_thread_dec_tmpref(from);
  }
@@ -13,23 +13,23 @@
 +#include <linux/uidgid.h>
 +#include <linux/printk.h>
 +
-+/* 0=off  1=observe(log only)  2=patch value '1'->'0'  */
-+static int dfm_spoof_mode = 1;
++/* 0=off 1=observe(log on match) 2=patch 3=verbose-diagnostic */
++static int dfm_spoof_mode = 3;
 +module_param(dfm_spoof_mode, int, 0644);
-+MODULE_PARM_DESC(dfm_spoof_mode, "DFM adb_enabled spoof: 0 off, 1 observe, 2 patch");
-+
-+/* target app uid (com.proxima.dfm). change at runtime if reinstalled. */
 +static int dfm_uid = 10297;
 +module_param(dfm_uid, int, 0644);
-+MODULE_PARM_DESC(dfm_uid, "uid whose adb_enabled reply is spoofed");
++static int dfm_hits;
++module_param(dfm_hits, int, 0444);
++static int dfm_total_replies;
++module_param(dfm_total_replies, int, 0444);
++static int dfm_uid_replies;
++module_param(dfm_uid_replies, int, 0444);
 +
-+static atomic_t dfm_hits = ATOMIC_INIT(0);
-+
-+/* UTF-16LE "adb_enabled" (Java Parcel strings are UTF-16LE) */
 +static const u8 dfm_key_u16[] = {
 +	'a',0,'d',0,'b',0,'_',0,'e',0,'n',0,'a',0,'b',0,'l',0,'e',0,'d',0
 +};
 +static const u8 dfm_key_ascii[] = { 'a','d','b','_','e','n','a','b','l','e','d' };
++static const u8 dfm_val_one_u16[] = { '1',0 };
 +
 +static int dfm_find(const u8 *hay, int hlen, const u8 *needle, int nlen)
 +{
@@ -42,21 +42,35 @@
 +	return -1;
 +}
 +
++static int dfm_find_last(const u8 *hay, int hlen, const u8 *needle, int nlen)
++{
++	int last = -1, from = 0, f;
++	while (from < hlen &&
++	       (f = dfm_find(hay + from, hlen - from, needle, nlen)) >= 0) {
++		last = from + f;
++		from = last + nlen;
++	}
++	return last;
++}
++
 +static void dfm_adb_hook(int reply, struct binder_proc *target_proc,
 +			 struct binder_transaction *in_reply_to,
 +			 struct binder_transaction *t)
 +{
 +	kuid_t euid;
-+	int tuid, qpos = -1;
-+	size_t rlen, qlen;
++	int tuid;
++	size_t rlen = 0, qlen = 0;
 +	u8 *rbuf = NULL, *qbuf = NULL;
++	int q16 = -1, q8 = -1, r16 = -1, r8 = -1;
++	int has_irt, has_irtbuf, has_toproc;
 +
 +	if (!reply || dfm_spoof_mode == 0)
 +		return;
 +	if (!target_proc || !target_proc->tsk || !t || !t->buffer)
 +		return;
 +
-+	/* cheap gate: only dfm's replies */
++	dfm_total_replies++;
++
 +	rcu_read_lock();
 +	euid = __task_cred(target_proc->tsk)->euid;
 +	rcu_read_unlock();
@@ -64,62 +78,82 @@
 +	if (tuid != dfm_uid)
 +		return;
 +
-+	rlen = t->buffer->data_size;
-+	if (rlen == 0 || rlen > 512)            /* settings reply is tiny */
-+		return;
++	dfm_uid_replies++;
 +
-+	/* correlate with request: must mention adb_enabled */
-+	if (in_reply_to && in_reply_to->buffer && in_reply_to->to_proc) {
++	has_irt = !!in_reply_to;
++	has_irtbuf = in_reply_to ? !!in_reply_to->buffer : 0;
++	has_toproc = in_reply_to ? !!in_reply_to->to_proc : 0;
++
++	rlen = t->buffer->data_size;
++	if (rlen > 0 && rlen <= 4096) {
++		rbuf = kmalloc(rlen, GFP_KERNEL);
++		if (rbuf && binder_alloc_copy_from_buffer(&target_proc->alloc,
++							  rbuf, t->buffer, 0, rlen)) {
++			kfree(rbuf);
++			rbuf = NULL;
++		}
++	}
++	if (has_irtbuf && has_toproc) {
 +		qlen = in_reply_to->buffer->data_size;
-+		if (qlen > 0 && qlen <= 2048) {
++		if (qlen > 0 && qlen <= 8192) {
 +			qbuf = kmalloc(qlen, GFP_KERNEL);
-+			if (qbuf &&
-+			    !binder_alloc_copy_from_buffer(&in_reply_to->to_proc->alloc,
-+							   qbuf, in_reply_to->buffer,
-+							   0, qlen)) {
-+				qpos = dfm_find(qbuf, qlen, dfm_key_u16,
-+						sizeof(dfm_key_u16));
-+				if (qpos < 0)
-+					qpos = dfm_find(qbuf, qlen, dfm_key_ascii,
-+							sizeof(dfm_key_ascii));
++			if (qbuf && binder_alloc_copy_from_buffer(&in_reply_to->to_proc->alloc,
++								  qbuf, in_reply_to->buffer, 0, qlen)) {
++				kfree(qbuf);
++				qbuf = NULL;
 +			}
 +		}
 +	}
-+	if (qpos < 0)
-+		goto out;   /* not an adb_enabled read */
++	if (qbuf) {
++		q16 = dfm_find(qbuf, qlen, dfm_key_u16, sizeof(dfm_key_u16));
++		q8 = dfm_find(qbuf, qlen, dfm_key_ascii, sizeof(dfm_key_ascii));
++	}
++	if (rbuf) {
++		r16 = dfm_find(rbuf, rlen, dfm_key_u16, sizeof(dfm_key_u16));
++		r8 = dfm_find(rbuf, rlen, dfm_key_ascii, sizeof(dfm_key_ascii));
++	}
 +
-+	rbuf = kmalloc(rlen, GFP_KERNEL);
-+	if (!rbuf)
-+		goto out;
-+	if (binder_alloc_copy_from_buffer(&target_proc->alloc, rbuf, t->buffer,
-+					  0, rlen))
-+		goto out;
-+
-+	atomic_inc(&dfm_hits);
-+
-+	if (dfm_spoof_mode == 1) {
-+		pr_info("DFM_ADB: hit#%d uid=%d rlen=%zu qpos=%d\n",
-+			atomic_read(&dfm_hits), tuid, rlen, qpos);
-+		print_hex_dump(KERN_INFO, "DFM_ADB REQ ", DUMP_PREFIX_OFFSET,
-+			       16, 1, qbuf, qlen, false);
-+		print_hex_dump(KERN_INFO, "DFM_ADB RPL ", DUMP_PREFIX_OFFSET,
-+			       16, 1, rbuf, rlen, false);
++	if (dfm_spoof_mode == 3) {
++		/* log only when adb_enabled seen (avoid flood); counters give reachability */
++		if (q16 >= 0 || q8 >= 0 || r16 >= 0 || r8 >= 0) {
++			pr_info("DFM_ADB v: uid=%d rlen=%zu irt=%d irtbuf=%d toproc=%d qlen=%zu q16=%d q8=%d r16=%d r8=%d\n",
++				tuid, rlen, has_irt, has_irtbuf, has_toproc,
++				qlen, q16, q8, r16, r8);
++			if (qbuf)
++				print_hex_dump(KERN_INFO, "DFM_ADB Q ", DUMP_PREFIX_OFFSET,
++					       16, 1, qbuf, qlen < 256 ? qlen : 256, false);
++			if (rbuf)
++				print_hex_dump(KERN_INFO, "DFM_ADB R ", DUMP_PREFIX_OFFSET,
++					       16, 1, rbuf, rlen < 256 ? rlen : 256, false);
++		}
 +		goto out;
 +	}
 +
-+	/* dfm_spoof_mode == 2: patch value '1'->'0'.
-+	 * WARNING: value locator below is a FIRST CUT. Read mode-1 dmesg first
-+	 * to confirm the exact value offset/encoding, then harden this. */
-+	{
-+		static const u8 one_u16[2]  = { '1', 0 };
-+		static const u8 zero_u16[2] = { '0', 0 };
-+		int p = dfm_find(rbuf, rlen, one_u16, sizeof(one_u16));
++	if (q16 < 0 && q8 < 0)
++		goto out;   /* request 不含 adb_enabled */
++	dfm_hits++;
 +
-+		if (p >= 0 &&
-+		    !binder_alloc_copy_to_buffer(&target_proc->alloc, t->buffer,
-+						 p, (void *)zero_u16, 2))
-+			pr_info("DFM_ADB: patched '1'->'0' at off=%d uid=%d\n",
-+				p, tuid);
++	if (dfm_spoof_mode == 1) {
++		pr_info("DFM_ADB: hit#%d uid=%d rlen=%zu q16=%d q8=%d r16=%d r8=%d\n",
++			dfm_hits, tuid, rlen, q16, q8, r16, r8);
++		if (rbuf)
++			print_hex_dump(KERN_INFO, "DFM_ADB RPL ", DUMP_PREFIX_OFFSET,
++				       16, 1, rbuf, rlen < 256 ? rlen : 256, false);
++		goto out;
++	}
++
++	/* mode 2: value = 末尾 UTF-16 '1' (31 00) -> '0' (30 00) */
++	if (rbuf) {
++		int p = dfm_find_last(rbuf, rlen, dfm_val_one_u16, sizeof(dfm_val_one_u16));
++
++		if (p >= 0) {
++			u8 zero[2] = { '0', 0 };
++
++			if (!binder_alloc_copy_to_buffer(&target_proc->alloc,
++							 t->buffer, p, zero, 2))
++				pr_info("DFM_ADB: patched '1'->'0' at off=%d uid=%d\n",
++					p, tuid);
++		}
 +	}
 +out:
 +	kfree(rbuf);
@@ -129,7 +163,7 @@
  
  static void binder_transaction(struct binder_proc *proc,
  			       struct binder_thread *thread,
-@@ -3914,6 +4036,9 @@
+@@ -3914,6 +4070,9 @@
  		return_error_line = __LINE__;
  		goto err_copy_data_failed;
  	}
