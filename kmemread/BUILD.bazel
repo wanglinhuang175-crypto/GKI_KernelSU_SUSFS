@@ -1,0 +1,18 @@
+# kleaf DDK 规则：把 kmemread.c 编成和 GKI 内核 ABI 匹配的 .ko。
+# CI 把本目录（连同 kmemread.c）复制进 ${workspace}/kernel/kmemread/，
+# 然后 tools/bazel build //kmemread:kmemread。
+#
+# 用 ddk_module（Google 现在主推的 out-of-tree 机制），不需要 Makefile。
+# kernel_build 指向 GKI 的 //common:kernel_aarch64 —— 和内核本体同一次
+# 构建、同一份 .config/Module.symvers ⇒ vermagic 与 MODVERSIONS 的 CRC
+# 自动一致，insmod 不会报 version mismatch。
+
+load("//build/kernel/kleaf:kernel.bzl", "ddk_module")
+
+ddk_module(
+    name = "kmemread",
+    kernel_build = "//common:kernel_aarch64",
+    srcs = ["kmemread.c"],
+    out = "kmemread.ko",
+    visibility = ["//visibility:public"],
+)
