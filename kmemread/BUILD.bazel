@@ -14,5 +14,8 @@ ddk_module(
     kernel_build = "//common:kernel_aarch64",
     srcs = ["kmemread.c"],
     out = "kmemread.ko",
+    # GKI 内核 KMI trim 后 DDK sandbox 缺 compiler-version.h/kconfig.h，
+    # 这个 ddk_headers 导出全部内核头补齐（kleaf 官方 errors.md 的解法）。
+    deps = ["//common:all_headers_aarch64"],
     visibility = ["//visibility:public"],
 )
