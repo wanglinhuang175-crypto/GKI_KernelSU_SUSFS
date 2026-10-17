@@ -1,9 +1,16 @@
-// kmemread —— 内核态跨进程读内存 PoC（反 ACE 隐蔽方向）
+// kmemread —— 内核态跨进程读/写内存 PoC（反 ACE 隐蔽方向）
 //
 // 目的：把 dfmread 的读取原语从用户态 process_vm_readv / pread(/proc/pid/mem)
 // 移到内核态。消除两个游戏可感知的暴露面：
 //   ① 不再 open("/proc/<游戏>/mem")  —— ACE 可枚举谁打开了它的 mem
 //   ② 不再对游戏发 process_vm_readv  —— 读取不经过任何游戏可感知的用户态 syscall
+//
+// 2026-10-17 增加写入原语（KMR_WRITE / KMR_WRITE_FORCE / KMR_VMA），
+// 用途是【检测面实验】：测 ACE 对内核态写内存是否有校验/回滚/报警，不是竞争优势。
+// 阶梯：level0 写无语义堆页 → level1 写本机 mesh CTW(可写页) → level2 FOLL_FORCE 穿只读页。
+//   • 非 force 写入【先查 VMA 权限】，只读段直接 -EACCES 拒绝，绝不静默硬写——
+//     否则"目标只读"会被误读成"ACE 拦截"。这是单变量实验的前提。
+//   • force 写入才加 FOLL_FORCE 穿 COW 页（level2），预期会被 .text 自校验发现。
 //
 // 机制：注册一个 misc 字符设备，用户态对它 ioctl(KMR_READ,{pid,addr,len,ubuf})，
 // 内核态用 access_process_vm(task, addr, buf, len, FOLL_FORCE) 读目标进程，
@@ -27,21 +34,25 @@
 #include <linux/sched/mm.h>
 #include <linux/pid.h>
 #include <linux/mm.h>
+#include <linux/mmap_lock.h>
 #include <linux/slab.h>
 #include <linux/kprobes.h>
 #include <linux/version.h>
 
 #define KMR_DEV_NAME "kmemread"
-#define KMR_MAX_LEN  (256 * 1024)   // 单次读上界，防止用户态传巨值把内核拖垮
+#define KMR_MAX_LEN  (256 * 1024)   // 单次读/写上界，防止用户态传巨值把内核拖垮
 
 // 和用户态 ktest.c / dfmread.c 共用的 ioctl 协议
 struct kmr_req {
 	__u32 pid;      // 目标进程 pid（vpid，调用者所在 pid namespace）
-	__u32 len;      // 要读的字节数，<= KMR_MAX_LEN
+	__u32 len;      // 读/写字节数，<= KMR_MAX_LEN；KMR_VMA 时须 >=8
 	__u64 addr;     // 目标进程虚拟地址
-	__u64 ubuf;     // 用户态接收缓冲区指针
+	__u64 ubuf;     // READ=接收缓冲区; WRITE/FORCE=源缓冲区; VMA=回写 vm_flags(u64)
 };
-#define KMR_READ _IOWR('k', 1, struct kmr_req)
+#define KMR_READ       _IOWR('k', 1, struct kmr_req)  // 读
+#define KMR_WRITE      _IOWR('k', 2, struct kmr_req)  // 写(仅限可写页, 不可写则拒绝不硬写)
+#define KMR_WRITE_FORCE _IOWR('k', 3, struct kmr_req) // 写(FOLL_FORCE, 穿只读/COW页—— level2 实验用)
+#define KMR_VMA        _IOWR('k', 4, struct kmr_req)  // 查 addr 所在 VMA 的 vm_flags
 
 // ---- 未导出符号：用 kprobe 拿 kallsyms_lookup_name 再查其余 ----
 static unsigned long (*kln)(const char *name);
@@ -49,6 +60,10 @@ static unsigned long (*kln)(const char *name);
 static int (*p_access_process_vm)(struct task_struct *tsk, unsigned long addr,
 				  void *buf, int len, unsigned int gup_flags);
 static struct task_struct *(*p_find_get_task_by_vpid)(pid_t nr);
+// VMA 预检用：GKI 对这几个符号同样不 EXPORT，统一 kprobe+kln 拿地址。
+static struct mm_struct *(*p_get_task_mm)(struct task_struct *task);
+static void (*p_mmput)(struct mm_struct *mm);
+static struct vm_area_struct *(*p_find_vma)(struct mm_struct *mm, unsigned long addr);
 
 static int resolve_kln(void)
 {
@@ -75,7 +90,43 @@ static int resolve_syms(void)
 		       p_access_process_vm, p_find_get_task_by_vpid);
 		return -ENOENT;
 	}
+	// VMA 预检符号：缺了不致命(退化成不预检)，但记一条日志便于排查。
+	p_get_task_mm = (void *)kln("get_task_mm");
+	p_mmput       = (void *)kln("mmput");
+	p_find_vma    = (void *)kln("find_vma");
+	if (!p_get_task_mm || !p_mmput || !p_find_vma)
+		pr_warn("kmemread: vma-precheck syms miss gtm=%px mmput=%px fv=%px"
+			" (写入将无法预检权限)\n",
+			p_get_task_mm, p_mmput, p_find_vma);
 	return 0;
+}
+
+// 查 addr 所在 VMA 的 vm_flags。返回 0 并把 flags 写进 *out；
+// <0 = 出错；-ENODATA = 符号缺失无法预检（调用方自行决定是否继续）。
+static long vma_flags(struct task_struct *task, unsigned long addr,
+		      unsigned long *out)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	long ret = 0;
+
+	if (!p_get_task_mm || !p_mmput || !p_find_vma)
+		return -ENODATA;
+
+	mm = p_get_task_mm(task);
+	if (!mm)
+		return -ESRCH;              // 内核线程 / 已退出，无用户地址空间
+
+	mmap_read_lock(mm);
+	vma = p_find_vma(mm, addr);
+	if (!vma || addr < vma->vm_start)
+		ret = -ENOMEM;              // addr 不落在任何已映射区间
+	else
+		*out = vma->vm_flags;
+	mmap_read_unlock(mm);
+
+	p_mmput(mm);
+	return ret;
 }
 
 // ---- 读取核心 ----
@@ -114,15 +165,104 @@ static long do_read(struct kmr_req *req)
 	return got;   // 返回实际读取字节数
 }
 
+// ---- 写入核心 ----
+// force=0：只写可写页。VMA 不带 VM_WRITE 时【直接拒绝(-EACCES)，绝不硬写】——
+//          这样"目标是只读段"和"ACE 拦了写"两种情况能从 errno 区分，不会被误读。
+// force=1：加 FOLL_FORCE，穿只读/COW 页（level2 实验：预期触发 COW 分裂，大概率被检测）。
+static long do_write(struct kmr_req *req, int force)
+{
+	struct task_struct *task;
+	void *kbuf;
+	long wrote;
+	unsigned int flags = FOLL_WRITE | (force ? FOLL_FORCE : 0);
+
+	if (req->len == 0 || req->len > KMR_MAX_LEN)
+		return -EINVAL;
+
+	task = p_find_get_task_by_vpid((pid_t)req->pid);
+	if (!task)
+		return -ESRCH;
+
+	// --- VMA 预检（仅非 force 路径）---
+	if (!force) {
+		unsigned long vf = 0;
+		long vr = vma_flags(task, (unsigned long)req->addr, &vf);
+		if (vr == -ENODATA) {
+			// 预检符号缺失：保守起见直接拒绝，避免"以为在测写入其实啥也没写"。
+			put_task_struct(task);
+			pr_warn("kmemread: write 拒绝—无法预检 VMA 权限\n");
+			return -EOPNOTSUPP;
+		}
+		if (vr < 0) {
+			put_task_struct(task);
+			return vr;              // 地址没映射 / 进程没地址空间
+		}
+		if (!(vf & VM_WRITE)) {
+			put_task_struct(task);
+			return -EACCES;         // 只读段：明确拒绝，交给调用方决定走不走 force
+		}
+	}
+
+	kbuf = kvmalloc(req->len, GFP_KERNEL);
+	if (!kbuf) {
+		put_task_struct(task);
+		return -ENOMEM;
+	}
+	if (copy_from_user(kbuf, (void __user *)(uintptr_t)req->ubuf, req->len)) {
+		kvfree(kbuf);
+		put_task_struct(task);
+		return -EFAULT;
+	}
+
+	wrote = p_access_process_vm(task, (unsigned long)req->addr,
+				    kbuf, (int)req->len, flags);
+	put_task_struct(task);
+	kvfree(kbuf);
+
+	if (wrote <= 0)
+		return wrote < 0 ? wrote : -EFAULT;
+	return wrote;   // 返回实际写入字节数
+}
+
+// ---- VMA 查询：把 vm_flags(u64) 回写到用户 ubuf ----
+static long do_vma(struct kmr_req *req)
+{
+	struct task_struct *task;
+	unsigned long vf = 0;
+	__u64 out;
+	long vr;
+
+	if (req->len < sizeof(__u64))
+		return -EINVAL;
+
+	task = p_find_get_task_by_vpid((pid_t)req->pid);
+	if (!task)
+		return -ESRCH;
+	vr = vma_flags(task, (unsigned long)req->addr, &vf);
+	put_task_struct(task);
+	if (vr < 0)
+		return vr;
+
+	out = (__u64)vf;
+	if (copy_to_user((void __user *)(uintptr_t)req->ubuf, &out, sizeof(out)))
+		return -EFAULT;
+	return sizeof(out);
+}
+
 static long kmr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct kmr_req req;
 
-	if (cmd != KMR_READ)
-		return -ENOTTY;
 	if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
 		return -EFAULT;
-	return do_read(&req);
+
+	switch (cmd) {
+	case KMR_READ:        return do_read(&req);
+	case KMR_WRITE:       return do_write(&req, 0);
+	case KMR_WRITE_FORCE: return do_write(&req, 1);
+	case KMR_VMA:         return do_vma(&req);
+	default:              return -ENOTTY;
+	}
 }
 
 static const struct file_operations kmr_fops = {
@@ -150,7 +290,7 @@ static int __init kmr_init(void)
 		pr_err("kmemread: misc_register failed %d\n", ret);
 		return ret;
 	}
-	pr_info("kmemread: ready at /dev/%s (apv=%px)\n",
+	pr_info("kmemread: ready at /dev/%s (apv=%px, rw+vma)\n",
 		KMR_DEV_NAME, p_access_process_vm);
 	return 0;
 }
