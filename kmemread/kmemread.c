@@ -38,6 +38,9 @@
 #include <linux/slab.h>
 #include <linux/kprobes.h>
 #include <linux/version.h>
+#include <linux/task_work.h>
+#include <linux/completion.h>
+#include <linux/mman.h>
 
 #define KMR_DEV_NAME "kmemread"
 #define KMR_MAX_LEN  (256 * 1024)   // 单次读/写上界，防止用户态传巨值把内核拖垮
@@ -53,6 +56,7 @@ struct kmr_req {
 #define KMR_WRITE      _IOWR('k', 2, struct kmr_req)  // 写(仅限可写页, 不可写则拒绝不硬写)
 #define KMR_WRITE_FORCE _IOWR('k', 3, struct kmr_req) // 写(FOLL_FORCE, 穿只读/COW页—— level2 实验用)
 #define KMR_VMA        _IOWR('k', 4, struct kmr_req)  // 查 addr 所在 VMA 的 vm_flags
+#define KMR_MMAP       _IOWR('k', 5, struct kmr_req)  // 在目标进程建 RWX 页(len=大小, ubuf 回写映射地址 u64)
 
 // ---- 未导出符号：用 kprobe 拿 kallsyms_lookup_name 再查其余 ----
 static unsigned long (*kln)(const char *name);
@@ -64,6 +68,13 @@ static struct task_struct *(*p_find_get_task_by_vpid)(pid_t nr);
 static struct mm_struct *(*p_get_task_mm)(struct task_struct *task);
 static void (*p_mmput)(struct mm_struct *mm);
 static struct vm_area_struct *(*p_find_vma)(struct mm_struct *mm, unsigned long addr);
+// KMR_MMAP 用：在目标进程上下文 vm_mmap 建 RWX 页。两个符号 GKI 同样不 EXPORT，kprobe+kln 拿。
+static unsigned long (*p_vm_mmap)(struct file *file, unsigned long addr,
+				  unsigned long len, unsigned long prot,
+				  unsigned long flag, unsigned long offset);
+static int (*p_task_work_add)(struct task_struct *task,
+			      struct callback_head *work,
+			      enum task_work_notify_mode notify);
 
 static int resolve_kln(void)
 {
@@ -98,6 +109,11 @@ static int resolve_syms(void)
 		pr_warn("kmemread: vma-precheck syms miss gtm=%px mmput=%px fv=%px"
 			" (写入将无法预检权限)\n",
 			p_get_task_mm, p_mmput, p_find_vma);
+	p_vm_mmap       = (void *)kln("vm_mmap");
+	p_task_work_add = (void *)kln("task_work_add");
+	if (!p_vm_mmap || !p_task_work_add)
+		pr_warn("kmemread: mmap syms miss vm_mmap=%px twa=%px (KMR_MMAP 不可用)\n",
+			p_vm_mmap, p_task_work_add);
 	return 0;
 }
 
@@ -249,6 +265,80 @@ static long do_vma(struct kmr_req *req)
 	return sizeof(out);
 }
 
+// ---- 在目标进程建 RWX 页（inline-hook 的 code cave）----
+// 难点：ioctl 跑在调用者(dfmread_pov)上下文, current->mm 是【调用者】的, 直接 vm_mmap
+// 会建在调用者进程里, 对目标没用。用 task_work_add 把 vm_mmap 排到【目标进程】返回用户态
+// 的边界执行 —— 那一刻 current==目标进程, vm_mmap 自然落在目标 mm。
+struct kmr_mmap_work {
+	struct callback_head cb;
+	unsigned long len;
+	unsigned long result;      // 成功=映射地址; 失败=IS_ERR_VALUE(-errno)
+	struct completion done;
+};
+
+static void kmr_mmap_cb(struct callback_head *cb)
+{
+	struct kmr_mmap_work *w = container_of(cb, struct kmr_mmap_work, cb);
+	// 此刻 current == 目标进程; vm_mmap 用 current->mm = 目标 mm
+	w->result = p_vm_mmap(NULL, 0, w->len,
+			      PROT_READ | PROT_WRITE | PROT_EXEC,
+			      MAP_PRIVATE | MAP_ANONYMOUS, 0);
+	complete(&w->done);
+}
+
+static long do_mmap_target(struct kmr_req *req)
+{
+	struct task_struct *task;
+	struct kmr_mmap_work *w;
+	unsigned long a;
+	long ret;
+
+	if (!p_vm_mmap || !p_task_work_add)
+		return -EOPNOTSUPP;
+	if (req->len == 0 || req->len > 16 * 1024 * 1024)
+		return -EINVAL;
+
+	task = p_find_get_task_by_vpid((pid_t)req->pid);
+	if (!task)
+		return -ESRCH;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w) {
+		put_task_struct(task);
+		return -ENOMEM;
+	}
+	init_task_work(&w->cb, kmr_mmap_cb);
+	init_completion(&w->done);
+	w->len = req->len;
+
+	ret = p_task_work_add(task, &w->cb, TWA_RESUME);
+	put_task_struct(task);
+	if (ret) {
+		kfree(w);
+		return ret;                 // 目标正在退出等, task_work 加不进去
+	}
+
+	// 等目标进程跑到用户态边界执行回调。活跃进程通常几毫秒内。
+	if (!wait_for_completion_timeout(&w->done, msecs_to_jiffies(5000))) {
+		// 超时: 回调可能仍会触发并访问 w, 【绝不 free】(否则 UAF→panic)。
+		// PoC 阶段选择泄漏这一个 w, 换取绝对不 panic。
+		pr_warn("kmemread: mmap task_work 超时(目标未返回用户态?)\n");
+		return -ETIMEDOUT;
+	}
+
+	a = w->result;
+	if (IS_ERR_VALUE(a)) {
+		ret = (long)a;              // vm_mmap 失败(如 W^X 被 LSM 拒 -EPERM)
+	} else if (copy_to_user((void __user *)(uintptr_t)req->ubuf,
+				&a, sizeof(a))) {
+		ret = -EFAULT;
+	} else {
+		ret = sizeof(a);
+	}
+	kfree(w);
+	return ret;
+}
+
 static long kmr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	struct kmr_req req;
@@ -261,6 +351,7 @@ static long kmr_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	case KMR_WRITE:       return do_write(&req, 0);
 	case KMR_WRITE_FORCE: return do_write(&req, 1);
 	case KMR_VMA:         return do_vma(&req);
+	case KMR_MMAP:        return do_mmap_target(&req);
 	default:              return -ENOTTY;
 	}
 }
