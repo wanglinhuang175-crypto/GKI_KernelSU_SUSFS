@@ -42,7 +42,7 @@
 #include <linux/completion.h>
 #include <linux/mman.h>
 
-#define KMR_DEV_NAME "kmemread"
+#define KMR_DEV_NAME "kmemread2"
 #define KMR_MAX_LEN  (256 * 1024)   // 单次读/写上界，防止用户态传巨值把内核拖垮
 
 // 和用户态 ktest.c / dfmread.c 共用的 ioctl 协议

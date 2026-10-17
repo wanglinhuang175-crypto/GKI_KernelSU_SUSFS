@@ -497,13 +497,13 @@ jobs:
         tools/bazel build \
           --config=fast \
           --disk_cache=/home/runner/.cache/bazel \
-          //kmemread:kmemread
-        KO="$(find bazel-bin/kmemread -name kmemread.ko 2>/dev/null | head -n1)"
+          //kmemread:kmemread2
+        KO="$(find bazel-bin/kmemread -name kmemread2.ko 2>/dev/null | head -n1)"
         echo "KO=$KO"
         if [ -n "$KO" ]; then
-          cp -v "$KO" /home/runner/kmemread.ko
+          cp -v "$KO" /home/runner/kmemread2.ko
           echo "=== vermagic (应含 6.1.99-android14-Wild) ==="
-          strings /home/runner/kmemread.ko | grep -i vermagic || true
+          strings /home/runner/kmemread2.ko | grep -i vermagic || true
         else
           echo "ERROR: kmemread.ko not found under bazel-bin/kmemread" >&2
           find bazel-bin -name '*.ko' 2>/dev/null | head || true
@@ -513,8 +513,8 @@ jobs:
       continue-on-error: true
       uses: actions/upload-artifact@v7
       with:
-        name: kmemread-ko
-        path: /home/runner/kmemread.ko
+        name: kmemread2-ko
+        path: /home/runner/kmemread2.ko
         if-no-files-found: warn
 
     - name: Get Cache Stats
